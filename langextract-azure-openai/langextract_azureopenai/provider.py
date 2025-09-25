@@ -133,6 +133,23 @@ class AzureOpenAILanguageModel(lx.core.base_model.BaseLanguageModel):
         """
         return None
 
+    @property
+    def requires_fence_output(self) -> bool:
+        """Whether this model requires fence output for parsing.
+        
+        Uses explicit override if set, otherwise defaults to True to ensure
+        output is wrapped in ```json fences for proper parsing by LangExtract.
+        """
+        if (
+            hasattr(self, '_fence_output_override')
+            and self._fence_output_override is not None
+        ):
+            return self._fence_output_override
+        
+        # Default to True since we don't use schema constraints
+        # LangExtract expects fenced output for proper parsing
+        return True
+
     def apply_schema(self, schema_instance: object | None) -> None:
         """Apply or clear schema configuration."""
         super().apply_schema(schema_instance)
@@ -167,6 +184,14 @@ class AzureOpenAILanguageModel(lx.core.base_model.BaseLanguageModel):
                     }
                 }
                 api_config['response_format'] = extraction_schema
+            else:
+                # For non-schema mode, always try to encourage JSON output
+                # Since we're always expecting structured data for LangExtract
+                try:
+                    api_config['response_format'] = {"type": "json_object"}
+                except Exception:
+                    # If json_object format is not supported, continue without it
+                    pass
             
             # Call the Azure OpenAI API
             response = self._client.chat.completions.create(**api_config)
@@ -175,12 +200,8 @@ class AzureOpenAILanguageModel(lx.core.base_model.BaseLanguageModel):
             if response.choices and len(response.choices) > 0:
                 content = response.choices[0].message.content or ""
                 
-                # For structured outputs, the content should already be valid JSON
-                if self._enable_structured_output:
-                    # GPT-5 structured outputs return clean JSON without markdown fences
-                    output_text = content.strip()
-                else:
-                    output_text = content
+                # Format the output according to LangExtract expectations
+                output_text = self._format_output_for_langextract(content)
                 
                 # Create ScoredOutput - using dummy score since Azure OpenAI doesn't provide log probabilities by default
                 scored_output = lx.core.types.ScoredOutput(
@@ -197,6 +218,82 @@ class AzureOpenAILanguageModel(lx.core.base_model.BaseLanguageModel):
 
         except Exception as e:
             raise lx.exceptions.InferenceError(f'Azure OpenAI API call failed: {e}') from e
+    
+    def _format_output_for_langextract(self, content: str) -> str:
+        """Format the model output according to LangExtract's expectations.
+        
+        Args:
+            content: Raw content from the model
+            
+        Returns:
+            Formatted output ready for LangExtract parsing
+        """
+        # For structured outputs, the content should already be valid JSON
+        if self._enable_structured_output:
+            # GPT-5 structured outputs return clean JSON without markdown fences
+            output_text = content.strip()
+            # Check if we need to add fencing
+            if self.requires_fence_output:
+                # Wrap in markdown fences for LangExtract parsing
+                output_text = f"```json\n{output_text}\n```"
+            return output_text
+        
+        # For non-structured output, check if the model already returned properly formatted content
+        content_stripped = content.strip()
+        
+        # If content is already fenced and we expect fences, return as-is
+        if self.requires_fence_output and content_stripped.startswith('```') and content_stripped.endswith('```'):
+            return content_stripped
+        
+        # If content is not fenced but we don't expect fences, and it's valid JSON, return as-is
+        if not self.requires_fence_output:
+            import json
+            try:
+                # Try to parse as JSON to validate
+                json.loads(content_stripped)
+                return content_stripped
+            except json.JSONDecodeError:
+                pass
+        
+        # If we get here, we need to format the content properly
+        import json
+        import re
+        
+        # Try to extract JSON from the content if it's wrapped in markdown
+        content_to_parse = content_stripped
+        json_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', content_stripped, re.DOTALL)
+        if json_match:
+            content_to_parse = json_match.group(1).strip()
+        
+        try:
+            # Check if content is valid JSON
+            parsed = json.loads(content_to_parse)
+            
+            # Ensure it has the extractions structure
+            if not isinstance(parsed, dict) or "extractions" not in parsed:
+                # Wrap in extractions structure
+                if isinstance(parsed, list):
+                    formatted_json = {"extractions": parsed}
+                else:
+                    formatted_json = {"extractions": [parsed]}
+            else:
+                formatted_json = parsed
+                
+            output_text = json.dumps(formatted_json, indent=2)
+            
+        except json.JSONDecodeError:
+            # If not valid JSON, return an empty extractions array
+            formatted_json = {
+                "extractions": []
+            }
+            output_text = json.dumps(formatted_json, indent=2)
+        
+        # Check if we need to add fencing
+        if self.requires_fence_output:
+            # Wrap in markdown fences for LangExtract parsing
+            output_text = f"```json\n{output_text}\n```"
+        
+        return output_text
 
     def infer(
         self, batch_prompts: Sequence[str], **kwargs: Any
