@@ -200,6 +200,18 @@ class AzureOpenAILanguageModel(lx.core.base_model.BaseLanguageModel):
             if response.choices and len(response.choices) > 0:
                 content = response.choices[0].message.content or ""
                 
+                # Handle empty content
+                if not content.strip():
+                    # Return empty extractions if no content
+                    import json
+                    empty_output = json.dumps({"extractions": []}, indent=2)
+                    if self.requires_fence_output:
+                        empty_output = f"```json\n{empty_output}\n```"
+                    return lx.core.types.ScoredOutput(
+                        output=empty_output,
+                        score=0.0
+                    )
+                
                 # Format the output according to LangExtract expectations
                 output_text = self._format_output_for_langextract(content)
                 
@@ -211,8 +223,12 @@ class AzureOpenAILanguageModel(lx.core.base_model.BaseLanguageModel):
                 return scored_output
             else:
                 # Handle empty response
+                import json
+                empty_output = json.dumps({"extractions": []}, indent=2)
+                if self.requires_fence_output:
+                    empty_output = f"```json\n{empty_output}\n```"
                 return lx.core.types.ScoredOutput(
-                    output="",
+                    output=empty_output,
                     score=0.0
                 )
 
@@ -228,36 +244,11 @@ class AzureOpenAILanguageModel(lx.core.base_model.BaseLanguageModel):
         Returns:
             Formatted output ready for LangExtract parsing
         """
-        # For structured outputs, the content should already be valid JSON
-        if self._enable_structured_output:
-            # GPT-5 structured outputs return clean JSON without markdown fences
-            output_text = content.strip()
-            # Check if we need to add fencing
-            if self.requires_fence_output:
-                # Wrap in markdown fences for LangExtract parsing
-                output_text = f"```json\n{output_text}\n```"
-            return output_text
-        
-        # For non-structured output, check if the model already returned properly formatted content
-        content_stripped = content.strip()
-        
-        # If content is already fenced and we expect fences, return as-is
-        if self.requires_fence_output and content_stripped.startswith('```') and content_stripped.endswith('```'):
-            return content_stripped
-        
-        # If content is not fenced but we don't expect fences, and it's valid JSON, return as-is
-        if not self.requires_fence_output:
-            import json
-            try:
-                # Try to parse as JSON to validate
-                json.loads(content_stripped)
-                return content_stripped
-            except json.JSONDecodeError:
-                pass
-        
-        # If we get here, we need to format the content properly
         import json
         import re
+        
+        # Always try to parse and convert the content to ensure proper format
+        content_stripped = content.strip()
         
         # Try to extract JSON from the content if it's wrapped in markdown
         content_to_parse = content_stripped
@@ -266,34 +257,145 @@ class AzureOpenAILanguageModel(lx.core.base_model.BaseLanguageModel):
             content_to_parse = json_match.group(1).strip()
         
         try:
-            # Check if content is valid JSON
+            # Parse the JSON
             parsed = json.loads(content_to_parse)
             
-            # Ensure it has the extractions structure
-            if not isinstance(parsed, dict) or "extractions" not in parsed:
-                # Wrap in extractions structure
-                if isinstance(parsed, list):
-                    formatted_json = {"extractions": parsed}
-                else:
-                    formatted_json = {"extractions": [parsed]}
-            else:
-                formatted_json = parsed
+            # Convert to LangExtract format
+            formatted_json = self._convert_to_langextract_format(parsed)
+            
+            # Double-check that we have valid extractions
+            if not formatted_json.get("extractions"):
+                # If no extractions, try to create a fallback based on the content
+                formatted_json = self._create_fallback_extraction(content_stripped)
                 
             output_text = json.dumps(formatted_json, indent=2)
             
         except json.JSONDecodeError:
-            # If not valid JSON, return an empty extractions array
-            formatted_json = {
-                "extractions": []
-            }
+            # If not valid JSON, try to create a fallback extraction
+            formatted_json = self._create_fallback_extraction(content_stripped)
             output_text = json.dumps(formatted_json, indent=2)
         
-        # Check if we need to add fencing
+        # Always add fencing for LangExtract parsing
         if self.requires_fence_output:
-            # Wrap in markdown fences for LangExtract parsing
             output_text = f"```json\n{output_text}\n```"
         
         return output_text
+    
+    def _convert_to_langextract_format(self, parsed: dict) -> dict:
+        """Convert standard JSON format to LangExtract's expected format.
+        
+        LangExtract expects a specific format where:
+        - extraction_class becomes the key (e.g., "Evaluation")
+        - extraction_text becomes the value
+        - attributes becomes "{extraction_class}_attributes"
+        
+        Args:
+            parsed: Standard JSON format
+            
+        Returns:
+            LangExtract format JSON
+        """
+        if not isinstance(parsed, dict):
+            return {"extractions": []}
+            
+        # Handle direct list format
+        if isinstance(parsed, list):
+            formatted_json = {"extractions": parsed}
+        elif "extractions" not in parsed:
+            # Wrap single extraction
+            if "extraction_class" in parsed:
+                formatted_json = {"extractions": [parsed]}
+            else:
+                formatted_json = {"extractions": []}
+        else:
+            formatted_json = parsed
+
+        # Convert each extraction to LangExtract format
+        langextract_extractions = []
+        for extraction in formatted_json.get("extractions", []):
+            if not isinstance(extraction, dict):
+                continue
+            
+            # Check if it's already in LangExtract format
+            is_langextract_format = any(key.endswith('_attributes') for key in extraction.keys())
+            
+            if is_langextract_format:
+                # Already in LangExtract format, keep as-is
+                langextract_extractions.append(extraction)
+                continue
+                
+            # Get extraction details from standard format
+            extraction_class = extraction.get("extraction_class", "unknown")
+            extraction_text = extraction.get("extraction_text", "")
+            attributes = extraction.get("attributes", {})
+            
+            # Ensure attributes is not None
+            if attributes is None:
+                attributes = {}
+                
+            # Create LangExtract format
+            langextract_extraction = {
+                extraction_class: extraction_text
+            }
+            
+            # Add attributes with proper naming convention
+            if attributes:
+                langextract_extraction[f"{extraction_class}_attributes"] = attributes
+                
+            langextract_extractions.append(langextract_extraction)
+
+        return {"extractions": langextract_extractions}
+    
+    def _create_fallback_extraction(self, content: str) -> dict:
+        """Create a fallback extraction when parsing fails.
+        
+        This method tries to extract meaningful information from the raw content
+        and formats it as a LangExtract extraction.
+        
+        Args:
+            content: Raw content from the model
+            
+        Returns:
+            LangExtract format JSON with fallback extraction
+        """
+        # Try to extract some meaningful text for classification
+        # Look for common classification responses
+        content_lower = content.lower().strip()
+        
+        if "acceptable" in content_lower or "unacceptable" in content_lower:
+            # Try to determine the evaluation
+            if "unacceptable" in content_lower:
+                evaluation = "Unacceptable"
+            else:
+                evaluation = "Acceptable"
+                
+            # Try to extract the text being evaluated
+            # Look for patterns like quotes or capitalized text
+            import re
+            
+            # Look for quoted text or all caps text that might be the item being evaluated
+            quoted_match = re.search(r'"([^"]+)"', content)
+            caps_match = re.search(r'\b([A-Z\s&]+)\b', content)
+            
+            extraction_text = "Unknown"
+            if quoted_match:
+                extraction_text = quoted_match.group(1)
+            elif caps_match and len(caps_match.group(1)) > 2:
+                extraction_text = caps_match.group(1).strip()
+            
+            return {
+                "extractions": [
+                    {
+                        "Evaluation": extraction_text,
+                        "Evaluation_attributes": {
+                            "evaluation": evaluation
+                        }
+                    }
+                ]
+            }
+        
+        # If we can't extract anything meaningful, return empty
+        return {"extractions": []}
 
     def infer(
         self, batch_prompts: Sequence[str], **kwargs: Any
