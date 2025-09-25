@@ -31,6 +31,7 @@ env/
 venv/
 ENV/
 *_env/
+.env.local5
 
 # Test & Coverage Reports
 .pytest_cache/
